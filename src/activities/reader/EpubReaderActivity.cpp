@@ -1009,11 +1009,11 @@ void EpubReaderActivity::loop() {
       return;
     }
     const bool forward = pendingManualTurn > 0;
-    pendingManualTurn = 0;
     const bool succeeded = pageTurn(forward);
     notePageTurn(forward, succeeded);
     if (succeeded && pendingManualTurnTouch) haptic_feedback::touchAction();
     pendingManualTurnTouch = false;
+    pendingManualTurn = 0;
     requestUpdate();
     return;
   }
@@ -2139,6 +2139,9 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   const bool combinedGrayscaleBase =
       tiledGrayscale && !pageHasImages && grayscale.base == HalDisplay::GrayscaleBase::Combined;
   const bool overlapRefresh = tiledGrayscale && grayscale.asyncBase && !pageHasImages;
+  const bool cancellableTextGrayscale = gpio.deviceIsX3() && needsTextGrayscale && tiledGrayscale &&
+                                        !page->hasImages() && !overlapRefresh &&
+                                        grayscale.base == HalDisplay::GrayscaleBase::Separate;
   auto renderGrayscalePass = [&]() {
     // A4 gray planes replace the full page, including its clipping highlights.
     if (BoardConfig::isEegoA4()) drawClippingHighlights(*page, fontId, orientedMarginTop, orientedMarginLeft);
@@ -2199,6 +2202,18 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
   }
   const auto tDisplay = millis();
+
+  bool grayscaleUploaded = false;
+  const auto cancelTextGrayscale = [&]() {
+    if (!cancellableTextGrayscale || pendingManualTurn.load() == 0) return false;
+    renderer.setRenderMode(GfxRenderer::BW);
+    // Partial uploads overwrite controller RAM, not the visible BW page. Rebase
+    // both planes before the next turn uses their differential baseline.
+    if (grayscaleUploaded) renderer.cleanupGrayscaleWithFrameBuffer();
+    LOG_DBG("ERS", "Text refinement cancelled for pending page turn after %lums", millis() - t0);
+    return true;
+  };
+  if (cancelTextGrayscale()) return;
 
   if (tiledGrayscale) {
     constexpr int STRIP_ROWS = 80;
@@ -2272,27 +2287,34 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       } else {
         renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
         for (int y = 0; y < gh; y += STRIP_ROWS) {
+          if (cancelTextGrayscale()) return;
           const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
           renderer.beginStripTarget(scratch.get(), y, rows);
           renderer.clearScreen(0x00);
           renderGrayscalePass();
           renderer.endStripTarget();
+          if (cancelTextGrayscale()) return;
           renderer.writeGrayscalePlaneStrip(true, scratch.get(), y, rows);
+          grayscaleUploaded = true;
         }
         const auto tGrayLsb = millis();
 
         renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
         for (int y = 0; y < gh; y += STRIP_ROWS) {
+          if (cancelTextGrayscale()) return;
           const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
           renderer.beginStripTarget(scratch.get(), y, rows);
           renderer.clearScreen(0x00);
           renderGrayscalePass();
           renderer.endStripTarget();
+          if (cancelTextGrayscale()) return;
           renderer.writeGrayscalePlaneStrip(false, scratch.get(), y, rows);
+          grayscaleUploaded = true;
         }
         const auto tGrayMsb = millis();
 
         renderer.setRenderMode(GfxRenderer::BW);
+        if (cancelTextGrayscale()) return;
         renderer.displayGrayBuffer();
         const auto tGrayDisplay = millis();
 
